@@ -1,7 +1,18 @@
-export default function Controls({ bpm, offset, subdivision = 1, onBpmChange, onOffsetChange, onSubdivisionChange }) {
+export default function Controls({
+  bpm,
+  offset,
+  subdivision = 1,
+  preLengthMs,
+  postLengthMs,
+  onBpmChange,
+  onOffsetChange,
+  onSubdivisionChange,
+  onPreLengthChange,
+  onPostLengthChange,
+}) {
   return (
     <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="text-xs text-slate-300">BPM</label>
           <input
@@ -31,6 +42,26 @@ export default function Controls({ bpm, offset, subdivision = 1, onBpmChange, on
             <option value={8}>8</option>
             <option value={16}>16</option>
           </select>
+        </div>
+        <div>
+          <label className="text-xs text-slate-300">Pre-marker length (ms)</label>
+          <input
+            className="input-field mt-1"
+            type="number"
+            min={0}
+            value={preLengthMs}
+            onChange={(e) => onPreLengthChange(Number(e.target.value))}
+          />
+        </div>
+        <div>
+          <label className="text-xs text-slate-300">Post-marker length (ms)</label>
+          <input
+            className="input-field mt-1"
+            type="number"
+            min={0}
+            value={postLengthMs}
+            onChange={(e) => onPostLengthChange(Number(e.target.value))}
+          />
         </div>
       </div>
     </div>

@@ -5,6 +5,8 @@ export default function Waveform({
   audioBuffer,
   bpm = 140,
   offset = 0,
+  preLengthMs = 120,
+  postLengthMs = 120,
   samples = [],
   onAddSample,
   onRemoveSample,
@@ -27,11 +29,7 @@ export default function Waveform({
   const timelinePosRef = useRef(0)
   useEffect(() => { timelinePosRef.current = timelinePos }, [timelinePos])
 
-  // adjustable sample length (seconds) and visual region
-  const [sampleLengthSec, setSampleLengthSec] = useState(0.25)
-  const scrollbarDragRef = useRef({ dragging: false })
-  const [debugTick, setDebugTick] = useState(0)
-
+  
   // Cap total canvas width to avoid huge memory usage
   // Increase display cap to allow deeper zoom; still limits extremely huge widths
   const MAX_CANVAS_PX = 200000
@@ -89,7 +87,25 @@ export default function Waveform({
     return Math.max(1, desiredPps)
   }
 
-  let totalWidthCss = 0
+  function getWaveformMetrics() {
+    const container = containerRef.current
+    if (!audioBuffer || !container) return null
+    const duration = audioBuffer.duration
+    const pps = computePpsForDuration(duration, pixelsPerSecond)
+    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
+    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const scale = displayWidth / Math.max(1, totalWidth)
+    return { container, duration, pps, totalWidth, displayWidth, scale }
+  }
+
+  function displayToLogical(displayX, scale) {
+    return Math.floor(displayX / Math.max(scale, 1e-6))
+  }
+
+  function getTimeForDisplay(displayX, duration, totalWidth, scale) {
+    const logicalX = displayToLogical(displayX, scale)
+    return (logicalX / Math.max(1, totalWidth)) * duration
+  }
 
   function renderBaseWaveform(ppsOverride) {
     const container = containerRef.current
@@ -148,15 +164,13 @@ export default function Waveform({
 
     // compute global samplesPerPixel across entire content (logical totalWidth)
     const channelData = audioBuffer.getChannelData(0)
-    // compute samples-per-pixel as float to map globalX -> sample range
     const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
     const scale = displayWidth / Math.max(1, totalWidth)
-
     const samplesPerPixelFloat = channelData.length / Math.max(1, totalWidth)
 
     // display scroll (in display pixels)
     const scrollLeftDisplay = container.scrollLeft
-    const logicalScrollLeft = displayToLogical(scrollLeftDisplay)
+    const logicalScrollLeft = displayToLogical(scrollLeftDisplay, scale)
 
     // background
     ctx.fillStyle = '#071024'
@@ -165,8 +179,8 @@ export default function Waveform({
     // draw waveform using tiled rendering to avoid expensive full redraws during fast scrolling
     const TILE_LOGICAL = 2048 // logical pixels per tile
     const preloadDisplay = Math.min(8000, viewportWidth * 2)
-    const viewportStartLogical = displayToLogical(scrollLeftDisplay)
-    const viewportLogicalWidth = displayToLogical(scrollLeftDisplay + viewportWidth) - viewportStartLogical
+    const viewportStartLogical = displayToLogical(scrollLeftDisplay, scale)
+    const viewportLogicalWidth = displayToLogical(scrollLeftDisplay + viewportWidth, scale) - viewportStartLogical
     const preloadLogical = Math.ceil(preloadDisplay / Math.max(scale, 1e-6))
     const startLogical = Math.max(0, viewportStartLogical - preloadLogical)
     const endLogical = Math.min(totalWidth, viewportStartLogical + viewportLogicalWidth + preloadLogical)
@@ -181,23 +195,24 @@ export default function Waveform({
       const tileLogicalStart = tileIndex * TILE_LOGICAL
       const tileLogicalEnd = Math.min(totalWidth, (tileIndex + 1) * TILE_LOGICAL)
       const tileDisplayStart = Math.round(tileLogicalStart * scale)
+      const tileDisplayWidth = Math.max(1, Math.round((tileLogicalEnd - tileLogicalStart) * scale))
+
       // if tile exists, draw it at correct position
       if (tile && tile.bitmap) {
         try {
-        const drawW = Math.round((tileLogicalEnd - tileLogicalStart) * scale)
-        ctx.drawImage(tile.bitmap, tileDisplayStart - scrollLeftDisplay, 0, drawW, height)
-      } catch (e) {
-        // ignore draw errors
+          ctx.drawImage(tile.bitmap, tileDisplayStart - scrollLeftDisplay, 0, tileDisplayWidth, height)
+        } catch (e) {
+          // ignore draw errors
+        }
+        return
       }
-      return
-      }
+
       // draw a quick low-res placeholder vertical bars to avoid blank area
       const pxStart = Math.round(tileLogicalStart * scale) - scrollLeftDisplay
       const pxEnd = Math.round(tileLogicalEnd * scale) - scrollLeftDisplay
       ctx.fillStyle = '#071024'
       ctx.fillRect(pxStart, 0, Math.max(1, pxEnd - pxStart), height)
       ctx.fillStyle = '#334155'
-      // draw rough downsample by sampling every Nth sample
       const approxStep = Math.max(1, Math.floor((tileLogicalEnd - tileLogicalStart) / 64))
       for (let lx = tileLogicalStart; lx < tileLogicalEnd; lx += approxStep) {
         const sx = Math.round(lx * scale) - scrollLeftDisplay
@@ -207,7 +222,6 @@ export default function Waveform({
       // schedule generation if not queued
       if (!tileQueueRef.current.has(key)) {
         tileQueueRef.current.add(key)
-        // generate asynchronously to avoid blocking scroll
         setTimeout(() => {
           try { generateTile(key, tileIndex, TILE_LOGICAL, pps, channelData, samplesPerPixelFloat, scale, height) } catch (e) { tileQueueRef.current.delete(key) }
         }, 8)
@@ -247,18 +261,19 @@ export default function Waveform({
     // draw sample markers (thin indicators) and sample regions
     ctx.fillStyle = '#fb7185'
     ctx.globalAlpha = 1
+    const preLengthSecFloat = Math.max(0, preLengthMs / 1000)
+    const postLengthSecFloat = Math.max(0, postLengthMs / 1000)
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i]
       const globalX = Math.round(s * pps)
       const x = Math.round(globalX * scale) - scrollLeftDisplay
       if (x >= -10 && x <= viewportWidth + 10) ctx.fillRect(x - 1, 0, 2, height)
-      // draw sample region (centered on marker)
-      const regionHalf = Math.round((sampleLengthSec * pps * scale) / 2)
-      const rx = x - regionHalf
-      const rw = regionHalf * 2
+      // draw sample region based on pre/post length
+      const regionStart = Math.round((s - preLengthSecFloat) * pps * scale) - scrollLeftDisplay
+      const regionWidth = Math.round((preLengthSecFloat + postLengthSecFloat) * pps * scale)
       ctx.globalAlpha = 0.12
       ctx.fillStyle = '#fb7185'
-      if (rx + rw >= -10 && rx <= viewportWidth + 10) ctx.fillRect(rx, 0, rw, height)
+      if (regionStart + regionWidth >= -10 && regionStart <= viewportWidth + 10) ctx.fillRect(regionStart, 0, regionWidth, height)
       ctx.globalAlpha = 1
     }
 
@@ -362,7 +377,6 @@ export default function Waveform({
       const tileLogicalEnd = Math.min(totalWidth, (tileIndex + 1) * tileLogicalSize)
       const tileDisplayWidth = Math.max(1, Math.round((tileLogicalEnd - tileLogicalStart) * scale))
       const dpr = window.devicePixelRatio || 1
-      // create canvas to draw tile
       const c = document.createElement('canvas')
       c.width = tileDisplayWidth * dpr
       c.height = height * dpr
@@ -370,38 +384,54 @@ export default function Waveform({
       c.style.height = `${height}px`
       const ctx = c.getContext('2d')
       ctx.setTransform(dpr,0,0,dpr,0,0)
-      // fill background
       ctx.fillStyle = '#071024'
       ctx.fillRect(0, 0, tileDisplayWidth, height)
-      ctx.strokeStyle = '#94a3b8'
-      ctx.lineWidth = 1
 
-      // for each display pixel in tile, aggregate min/max from channelData
+      // centerline and subtle grid of waveform
+      ctx.strokeStyle = 'rgba(148,163,184,0.08)'
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(0, height * 0.5)
+      ctx.lineTo(tileDisplayWidth, height * 0.5)
+      ctx.stroke()
+
       const samplesLen = channelData.length
+      const invScale = 1 / Math.max(scale, 1e-6)
+
       for (let dx = 0; dx < tileDisplayWidth; dx++) {
-        // compute logical x for this display pixel
-        const logicalX = tileLogicalStart + Math.floor(dx / Math.max(scale, 1e-6))
-        const startSample = Math.floor(logicalX * samplesPerPixelFloat)
-        const endSample = Math.min(samplesLen - 1, Math.floor((logicalX + 1) * samplesPerPixelFloat) - 1)
+        const logicalStart = tileLogicalStart + dx * invScale
+        const logicalEnd = Math.min(tileLogicalEnd, tileLogicalStart + (dx + 1) * invScale)
+        const startSample = Math.max(0, Math.min(samplesLen - 1, Math.floor(logicalStart * samplesPerPixelFloat)))
+        const endSample = Math.max(startSample, Math.min(samplesLen - 1, Math.floor(logicalEnd * samplesPerPixelFloat) - 1))
+
         let min = 1.0
         let max = -1.0
+        let sumSq = 0
+        let count = 0
+
         if (startSample <= endSample && startSample < samplesLen) {
           for (let i = startSample; i <= endSample; i++) {
             const v = channelData[i]
             if (v < min) min = v
             if (v > max) max = v
+            sumSq += v * v
+            count++
           }
+        } else if (startSample < samplesLen) {
+          const v = channelData[startSample]
+          min = max = v
+          sumSq = v * v
+          count = 1
         }
+
+        const rms = count > 0 ? Math.sqrt(sumSq / count) : 0
         const y1 = (1 + min) * 0.5 * height
         const y2 = (1 + max) * 0.5 * height
-        const sx = dx + 0.5
-        ctx.beginPath()
-        ctx.moveTo(sx, y1)
-        ctx.lineTo(sx, y2)
-        ctx.stroke()
+        const intensity = Math.min(1, rms * 1.5)
+        ctx.fillStyle = `rgba(96,165,250,${0.1 + intensity * 0.15})`
+        ctx.fillRect(dx, Math.min(y1, y2), 1, Math.max(1, Math.abs(y2 - y1)))
       }
 
-      // convert to ImageBitmap if supported for faster draws
       let bitmap = null
       if (typeof createImageBitmap === 'function') {
         try { bitmap = await createImageBitmap(c) } catch (e) { bitmap = c }
@@ -409,7 +439,6 @@ export default function Waveform({
 
       tileCacheRef.current.set(key, { bitmap })
     } catch (e) {
-      // generation failed; ensure key removed from queue and cache
       console.warn('generateTile error', e)
     } finally {
       tileQueueRef.current.delete(key)
@@ -422,19 +451,17 @@ export default function Waveform({
     const content = contentRef.current
     if (!base || !container || !content || !audioBuffer) return
     const rect = base.getBoundingClientRect()
-    const clickX = (e.clientX - rect.left)
+    const clickX = e.clientX - rect.left
     const scrollLeftDisplay = container.scrollLeft
-    const duration = audioBuffer.duration
-    const pps = computePpsForDuration(duration, pixelsPerSecond)
-    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
-    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const metrics = getWaveformMetrics()
+    if (!metrics) return
+    const { duration, totalWidth, scale } = metrics
     const displayGlobalX = clickX + scrollLeftDisplay
-    const logicalX = displayToLogical(displayGlobalX)
-    const time = (logicalX / Math.max(1, totalWidth)) * duration
+    const time = getTimeForDisplay(displayGlobalX, duration, totalWidth, scale)
 
     // convert pixel threshold to time threshold
     const pxThreshold = 10
-    const timeThresholdLogical = Math.max(1, Math.floor((pxThreshold) / Math.max(scale, 1e-6)))
+    const timeThresholdLogical = Math.max(1, Math.floor(pxThreshold / Math.max(scale, 1e-6)))
     const timeThreshold = (timeThresholdLogical / Math.max(1, totalWidth)) * duration
     for (let i = 0; i < samples.length; i++) {
       if (Math.abs(samples[i] - time) <= timeThreshold) {
@@ -452,16 +479,13 @@ export default function Waveform({
     const content = contentRef.current
     if (!base || !container || !content || !audioBuffer) return
     const rect = base.getBoundingClientRect()
-    const clickX = (e.clientX - rect.left)
+    const clickX = e.clientX - rect.left
     const scrollLeftDisplay = container.scrollLeft
-    const duration = audioBuffer.duration
-    const pps = computePpsForDuration(duration, pixelsPerSecond)
-    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
-    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const metrics = getWaveformMetrics()
+    if (!metrics) return
+    const { duration, totalWidth, scale } = metrics
     const displayGlobalX = clickX + scrollLeftDisplay
-    const logicalX = displayToLogical(displayGlobalX)
-    const time = (logicalX / Math.max(1, totalWidth)) * duration
-    // persist timeline position
+    const time = getTimeForDisplay(displayGlobalX, duration, totalWidth, scale)
     setTimelinePos(time)
     onSeek(time)
   }
@@ -473,27 +497,14 @@ export default function Waveform({
     const content = contentRef.current
     if (!base || !container || !content || !audioBuffer) return
     const rect = base.getBoundingClientRect()
-    const clickX = (e.clientX - rect.left)
+    const clickX = e.clientX - rect.left
     const scrollLeftDisplay = container.scrollLeft
-    const duration = audioBuffer.duration
-    const pps = computePpsForDuration(duration, pixelsPerSecond)
-    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
-    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const metrics = getWaveformMetrics()
+    if (!metrics) return
+    const { duration, totalWidth, scale } = metrics
     const displayGlobalX = clickX + scrollLeftDisplay
-    const logicalX = displayToLogical(displayGlobalX)
-    const time = (logicalX / Math.max(1, totalWidth)) * duration
-    // if right-click near a marker -> remove it (time-based threshold)
-    const pxThreshold = 10
-    const timeThresholdLogical = Math.max(1, Math.floor((pxThreshold) / Math.max(scale, 1e-6)))
-    const timeThreshold = (timeThresholdLogical / Math.max(1, totalWidth)) * duration
-    for (let i = 0; i < samples.length; i++) {
-      if (Math.abs(samples[i] - time) <= timeThreshold) {
-        onRemoveSample(i)
-        return
-      }
-    }
+    const time = getTimeForDisplay(displayGlobalX, duration, totalWidth, scale)
 
-    // otherwise right-click seeks playhead and persists timeline position
     setTimelinePos(time)
     if (player && typeof player.seek === 'function') player.seek(time)
   }
@@ -505,35 +516,31 @@ export default function Waveform({
     const content = contentRef.current
     if (!base || !container || !content || !audioBuffer) return
     const rect = base.getBoundingClientRect()
-    const clickX = (e.clientX - rect.left)
+    const clickX = e.clientX - rect.left
     const scrollLeftDisplay = container.scrollLeft
-    const duration = audioBuffer.duration
-    const pps = computePpsForDuration(duration, pixelsPerSecond)
-    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
-    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const metrics = getWaveformMetrics()
+    if (!metrics) return
+    const { duration, totalWidth, displayWidth, scale } = metrics
     const offsetDisplayX = Math.round(((offset / 1000) / Math.max(1, duration)) * displayWidth) - scrollLeftDisplay
     const nearOffset = Math.abs(clickX - offsetDisplayX) <= 8
     base.style.cursor = nearOffset ? 'ew-resize' : 'crosshair'
   }
 
   function handleMouseDown(e) {
-    // if mousedown near offset line -> start offset drag
     const base = baseCanvasRef.current
     const container = containerRef.current
     const content = contentRef.current
     if (!base || !container || !content || !audioBuffer) return
     const rect = base.getBoundingClientRect()
-    const clickX = (e.clientX - rect.left)
+    const clickX = e.clientX - rect.left
     const scrollLeftDisplay = container.scrollLeft
-    const duration = audioBuffer.duration
-    const pps = computePpsForDuration(duration, pixelsPerSecond)
-    const totalWidth = Math.max(Math.round(duration * pps), container.clientWidth)
-    const displayWidth = Math.min(totalWidth, MAX_CANVAS_PX)
+    const metrics = getWaveformMetrics()
+    if (!metrics) return
+    const { duration, displayWidth } = metrics
     const displayX = clickX + scrollLeftDisplay
     const offsetDisplayX = Math.round(((offset / 1000) / Math.max(1, duration)) * displayWidth)
     const nearOffset = Math.abs(displayX - offsetDisplayX) <= 8
     if (nearOffset && typeof onOffsetChange === 'function') {
-      // start drag
       draggingOffset = true
       dragStartX = displayX
       originalOffset = offset
@@ -553,7 +560,6 @@ export default function Waveform({
       return
     }
 
-    // otherwise scrub
     handleSeek(e)
     function onMove(ev) { handleSeek(ev) }
     function onUp() { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
@@ -654,13 +660,6 @@ export default function Waveform({
     return () => container.removeEventListener('wheel', handler)
   }, [audioBuffer])
 
-  // debug tick to force occasional re-render for debug readout
-  useEffect(() => {
-    const id = setInterval(() => setDebugTick((t) => (t + 1) % 100000), 250)
-    return () => clearInterval(id)
-  }, [])
-
-
   return (
     <div className="bg-slate-800 border border-slate-700 rounded-lg p-2">
       <div className="flex items-center gap-3 mb-2">
@@ -709,19 +708,7 @@ export default function Waveform({
         </div>
 
         <div>
-          <p className="text-xs text-slate-400 mt-2 mb-2">Click to add a mark. Drag on waveform to scrub/seek. Zoom for detail. Left-click marker to remove; right-click to seek (or right-click marker to remove).</p>
-
-          {/* debug readout to help diagnose scroll/zoom issues */}
-          <div className="text-xs text-slate-500">
-            <span>scrollLeft: </span>
-            <span id="wf-debug-scroll">{containerRef.current ? containerRef.current.scrollLeft : 0}</span>
-            <span> • contentWidth: </span>
-            <span id="wf-debug-width">{contentRef.current ? contentRef.current.style.width : '0px'}</span>
-            <span> • viewport: </span>
-            <span id="wf-debug-viewport">{containerRef.current ? containerRef.current.clientWidth : 0}</span>
-            <span> • px/s: </span>
-            <span>{pixelsPerSecond}</span>
-          </div>
+          <p className="text-xs text-slate-400 mt-2 mb-2">Click to add a mark. Drag on waveform to scrub/seek. Scroll wheel zooms to cursor. Left-click marker to remove; right-click seeks playback cursor. Press Space to toggle pause/resume.</p>
         </div>
         </div>
   )

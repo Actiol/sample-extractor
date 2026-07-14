@@ -15,6 +15,8 @@ export default function App() {
   const [samples, setSamples] = useState([])
   const [averagedSample, setAveragedSample] = useState(null)
   const [status, setStatus] = useState('Load an audio file to begin')
+  const [preLengthMs, setPreLengthMs] = useState(120)
+  const [postLengthMs, setPostLengthMs] = useState(120)
 
   // player & audio context
   const audioContextRef = useRef(null)
@@ -39,6 +41,32 @@ export default function App() {
     setIsPlayingState(player.isPlaying)
   }, [player])
 
+  useEffect(() => {
+    const handleKeyDown = async (e) => {
+      if (e.code !== 'Space' && e.key !== ' ') return
+      const target = e.target
+      if (target && target instanceof HTMLElement) {
+        const tag = target.tagName
+        if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(tag) || target.isContentEditable) return
+      }
+      if (!player) return
+      e.preventDefault()
+      if (player.isPlaying) {
+        player.pause()
+        setIsPlayingState(false)
+      } else if (typeof player.resume === 'function') {
+        player.resume()
+        setIsPlayingState(true)
+      } else if (audioBuffer) {
+        const currentTime = typeof player.getCurrentTime === 'function' ? player.getCurrentTime() : 0
+        player.play(audioBuffer, currentTime)
+        setIsPlayingState(true)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [player, audioBuffer])
 
   // Metronome: schedule a simple click using oscillator while player is playing
   useEffect(() => {
@@ -134,27 +162,24 @@ export default function App() {
     const epsilon = 0.005
     if (samples.some(s => Math.abs(s - snappedTime) < epsilon)) return
 
-    const newSamples = [...samples, snappedTime].sort((a, b) => a - b)
-    setSamples(newSamples)
-
-    // Compute average
-    if (audioBuffer && newSamples.length > 0) {
-      const averaged = computeAverage(audioBuffer, newSamples)
-      setAveragedSample(averaged)
-    }
+    setSamples((prev) => [...prev, snappedTime].sort((a, b) => a - b))
   }
 
   const handleRemoveSample = (index) => {
-    const newSamples = samples.filter((_, i) => i !== index)
-    setSamples(newSamples)
-    
-    if (audioBuffer && newSamples.length > 0) {
-      const averaged = computeAverage(audioBuffer, newSamples)
-      setAveragedSample(averaged)
-    } else {
-      setAveragedSample(null)
-    }
+    setSamples((prev) => prev.filter((_, i) => i !== index))
   }
+
+  useEffect(() => {
+    if (!audioBuffer || samples.length === 0) {
+      setAveragedSample(null)
+      return
+    }
+    const averaged = computeAverage(audioBuffer, samples, {
+      preSec: preLengthMs / 1000,
+      postSec: postLengthMs / 1000,
+    })
+    setAveragedSample(averaged)
+  }, [audioBuffer, samples, preLengthMs, postLengthMs, computeAverage])
 
   const handleClearSamples = () => {
     setSamples([])
@@ -231,9 +256,13 @@ export default function App() {
                 bpm={bpm}
                 offset={offset}
                 subdivision={subdivision}
+                preLengthMs={preLengthMs}
+                postLengthMs={postLengthMs}
                 onBpmChange={setBpm}
                 onOffsetChange={setOffset}
                 onSubdivisionChange={setSubdivision}
+                onPreLengthChange={setPreLengthMs}
+                onPostLengthChange={setPostLengthMs}
               />
             )}
 
@@ -243,6 +272,8 @@ export default function App() {
                 audioBuffer={audioBuffer}
                 bpm={bpm}
                 offset={offset}
+                preLengthMs={preLengthMs}
+                postLengthMs={postLengthMs}
                 samples={samples}
                 onAddSample={handleAddSample}
                 onRemoveSample={handleRemoveSample}
