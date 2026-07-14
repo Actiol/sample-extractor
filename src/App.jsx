@@ -1,10 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
-import Editor from './components/Editor'
-import Sidebar from './components/Sidebar'
+import { useState, useEffect, useRef } from 'react'
+import AudioLoader from './components/AudioLoader'
+import Controls from './components/Controls'
+import Waveform from './components/Waveform'
+import Player from './components/Player'
+import SampleList from './components/SampleList'
+import PreviewWaveform from './components/PreviewWaveform'
 import { useAudioPlayer } from './hooks/useAudioPlayer'
 import { useAudioProcessing } from './hooks/useAudioProcessing'
-import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
-import { useUndoRedo } from './hooks/useUndoRedo'
 
 export default function App() {
   const [audioBuffer, setAudioBuffer] = useState(null)
@@ -13,32 +15,23 @@ export default function App() {
   const [samples, setSamples] = useState([])
   const [averagedSample, setAveragedSample] = useState(null)
   const [status, setStatus] = useState('Load an audio file to begin')
+  const [preLengthMs, setPreLengthMs] = useState(120)
+  const [postLengthMs, setPostLengthMs] = useState(120)
 
   // player & audio context
   const audioContextRef = useRef(null)
   const player = useAudioPlayer(audioContextRef)
   const { computeAverage } = useAudioProcessing()
 
-  // Audio state
-  const [audioBuffer, setAudioBuffer] = useState(null)
-  const [bpm, setBpm] = useState(120)
-  const [offset, setOffset] = useState(0)
-  
-  // Undo/redo for samples
-  const { state: samples, push: setSamples, undo, redo, canUndo, canRedo } = useUndoRedo([])
-
-  // UI state
-  const [averagedSample, setAveragedSample] = useState(null)
-  const [metronomeEnabled, setMetronomeEnabled] = useState(false)
-  const [metronomeVolume, setMetronomeVolume] = useState(0.3)
+  // UI state for player and metronome
   const [playerVolume, setPlayerVolume] = useState(1)
-  const [status, setStatus] = useState('Load an audio file to begin')
-  const [showSettings, setShowSettings] = useState(false)
-  const [snapToGrid, setSnapToGrid] = useState(true)
-  const [subdivision, setSubdivision] = useState(4)
-  const [zoom, setZoom] = useState(100)
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false)
+  const [metronomeVolume, setMetronomeVolume] = useState(0.5)
+  const [isPlayingState, setIsPlayingState] = useState(false)
+  const [zoomPps, setZoomPps] = useState(200)
+  const [subdivision, setSubdivision] = useState(1)
 
-  // Recalculate averaged sample when samples change
+  // Apply player volume when changed
   useEffect(() => {
     if (player) player.setVolume(playerVolume)
   }, [player, playerVolume])
@@ -48,145 +41,198 @@ export default function App() {
     setIsPlayingState(player.isPlaying)
   }, [player])
 
+  useEffect(() => {
+    const handleKeyDown = async (e) => {
+      if (e.code !== 'Space' && e.key !== ' ') return
+      const target = e.target
+      if (target && target instanceof HTMLElement) {
+        const tag = target.tagName
+        if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(tag) || target.isContentEditable) return
+      }
+      if (!player) return
+      e.preventDefault()
+      if (player.isPlaying) {
+        player.pause()
+        setIsPlayingState(false)
+      } else if (typeof player.resume === 'function') {
+        player.resume()
+        setIsPlayingState(true)
+      } else if (audioBuffer) {
+        const currentTime = typeof player.getCurrentTime === 'function' ? player.getCurrentTime() : 0
+        player.play(audioBuffer, currentTime)
+        setIsPlayingState(true)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [player, audioBuffer])
 
   // Metronome: schedule a simple click using oscillator while player is playing
   useEffect(() => {
     let intervalId = null
     let timeoutId = null
-    if (!metronomeEnabled || !audioContextRef.current || !player.isPlaying) return
+    if (!metronomeEnabled) return () => {}
 
-    const playClick = () => {
+    const ctx = audioContextRef.current
+    if (!ctx) return () => {}
+
+    function playClick() {
       try {
-        const ctx = audioContextRef.current
         const o = ctx.createOscillator()
         const g = ctx.createGain()
-        o.type = 'sine'
-        o.frequency.value = 1000
+        o.type = 'square'
+        o.frequency.value = 1200
         g.gain.value = metronomeVolume
         o.connect(g).connect(ctx.destination)
         const now = ctx.currentTime
         g.gain.setValueAtTime(metronomeVolume, now)
-        g.gain.exponentialRampToValueAtTime(0.01, now + 0.08)
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 0.05)
         o.start(now)
-        o.stop(now + 0.1)
-      } catch (e) {}
+        o.stop(now + 0.06)
+      } catch (e) {
+        // ignore
+      }
     }
 
-    const schedule = () => {
+    function schedule() {
       const beatSec = 60 / Math.max(1, bpm)
       const offsetSec = offset / 1000
       const pos = player.getCurrentTime ? player.getCurrentTime() : 0
+      // next beat time after current pos
       let n = Math.ceil((pos - offsetSec) / beatSec)
       if (pos < offsetSec) n = 0
       const nextBeat = offsetSec + n * beatSec
       const delayMs = Math.max(0, (nextBeat - pos) * 1000)
       timeoutId = setTimeout(() => {
         playClick()
-        intervalId = setInterval(playClick, beatSec * 1000)
+        // then schedule repeated interval
+        intervalId = setInterval(() => playClick(), beatSec * 1000)
       }, delayMs)
     }
 
-    if (player.isPlaying) schedule()
+    // start scheduling if player is playing
+    if (player && player.isPlaying) schedule()
 
-    const checkId = setInterval(() => {
-      if (player.isPlaying && !intervalId && !timeoutId) schedule()
-      if (!player.isPlaying && intervalId) {
-        clearInterval(intervalId)
-        intervalId = null
-        if (timeoutId) {
-          clearTimeout(timeoutId)
-          timeoutId = null
-        }
+    // react to player state changes by rescheduling
+    const id = setInterval(() => {
+      if (!player) return
+      if (player.isPlaying && intervalId == null && timeoutId == null) schedule()
+      if (!player.isPlaying && intervalId != null) {
+        clearInterval(intervalId); intervalId = null
+        if (timeoutId != null) { clearTimeout(timeoutId); timeoutId = null }
       }
     }, 200)
 
     return () => {
-      clearInterval(checkId)
+      clearInterval(id)
       if (intervalId) clearInterval(intervalId)
       if (timeoutId) clearTimeout(timeoutId)
     }
   }, [metronomeEnabled, bpm, offset, metronomeVolume, player])
 
-  // Sync player volume
-  useEffect(() => {
-    if (player) player.setVolume(playerVolume)
-  }, [player, playerVolume])
 
-  const handleAudioLoaded = async (arrayBuffer) => {
+  const handleAudioLoaded = async (payload) => {
+    // payload may be an ArrayBuffer (from AudioLoader) or an already-decoded AudioBuffer
     try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      if (payload instanceof ArrayBuffer) {
+        // decode using the app audio context so playback uses the same context
+        if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+        const decoded = await audioContextRef.current.decodeAudioData(payload.slice(0))
+        setAudioBuffer(decoded)
+      } else {
+        setAudioBuffer(payload)
       }
-      const decoded = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0))
-      setAudioBuffer(decoded)
-      setSamples([]) // Reset samples on new audio
-      setStatus('Audio loaded. Click waveform to mark samples.')
+      setSamples([])
+      setAveragedSample(null)
+      setStatus('Audio loaded. Adjust timing and mark samples.')
     } catch (err) {
-      console.error('Failed to decode audio', err)
+      console.error('Failed to decode audio in app context', err)
       setStatus('Failed to decode audio file')
     }
   }
 
-  const handleAddSample = useCallback((time) => {
+  const handleAddSample = (time) => {
     if (!audioBuffer) return
     const beatSec = 60 / Math.max(1, bpm)
     const gridSec = beatSec / Math.max(1, subdivision)
-    const snappedTime = snapToGrid ? Math.round(time / gridSec) * gridSec : time
+    const snappedTime = Math.round(time / gridSec) * gridSec
 
-    // Avoid duplicates
-    if (samples.some(s => Math.abs(s - snappedTime) < 0.005)) return
+    // avoid duplicates (within 5ms)
+    const epsilon = 0.005
+    if (samples.some(s => Math.abs(s - snappedTime) < epsilon)) return
 
-    const newSamples = [...samples, snappedTime].sort((a, b) => a - b)
-    setSamples(newSamples)
-
-    // Compute average
-    if (audioBuffer && newSamples.length > 0) {
-      const averaged = computeAverage(audioBuffer, newSamples)
-      setAveragedSample(averaged)
-    }
+    setSamples((prev) => [...prev, snappedTime].sort((a, b) => a - b))
   }
 
   const handleRemoveSample = (index) => {
-    const newSamples = samples.filter((_, i) => i !== index)
-    setSamples(newSamples)
-    
-    if (audioBuffer && newSamples.length > 0) {
-      const averaged = computeAverage(audioBuffer, newSamples)
-      setAveragedSample(averaged)
-    } else {
-      setAveragedSample(null)
-    }
+    setSamples((prev) => prev.filter((_, i) => i !== index))
   }
+
+  useEffect(() => {
+    if (!audioBuffer || samples.length === 0) {
+      setAveragedSample(null)
+      return
+    }
+    const averaged = computeAverage(audioBuffer, samples, {
+      preSec: preLengthMs / 1000,
+      postSec: postLengthMs / 1000,
+    })
+    setAveragedSample(averaged)
+  }, [audioBuffer, samples, preLengthMs, postLengthMs, computeAverage])
 
   const handleClearSamples = () => {
     setSamples([])
-    setStatus('Cleared all samples')
+    setAveragedSample(null)
+    player.stop()
+  }
+
+  const handlePlayAveraged = async () => {
+    if (averagedSample && audioContextRef.current) {
+      console.log('App: handlePlayAveraged requested, samples=', averagedSample.length)
+      try {
+        if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+        if (typeof audioContextRef.current.resume === 'function') await audioContextRef.current.resume()
+      } catch (e) { console.warn('AudioContext resume failed', e) }
+      const buffer = audioContextRef.current.createBuffer(
+        1,
+        averagedSample.length,
+        audioContextRef.current.sampleRate
+      )
+      buffer.getChannelData(0).set(averagedSample)
+      console.log('App: playing averaged buffer duration=', buffer.duration)
+      const ok = await player.play(buffer, 0) // play averaged at 0
+      if (!ok) {
+        console.warn('App: WebAudio play failed, falling back to HTMLAudioElement')
+        const wav = encodeWAV(buffer.getChannelData(0), audioContextRef.current.sampleRate)
+        const blob = new Blob([wav], { type: 'audio/wav' })
+        const url = URL.createObjectURL(blob)
+        const a = new Audio(url)
+        a.play().catch(e => console.warn('HTMLAudioElement fallback failed', e))
+        a.onended = () => URL.revokeObjectURL(url)
+      }
+    }
   }
 
   const handleExtract = () => {
-    if (!averagedSample || !audioContextRef.current) {
-      setStatus('No samples to extract')
+    if (!averagedSample) {
+      setStatus('No averaged sample to extract')
       return
     }
 
-    const wav = encodeWAV(averagedSample, audioContextRef.current.sampleRate)
+    const wav = encodeWAV(
+      averagedSample,
+      audioContextRef.current.sampleRate
+    )
     const blob = new Blob([wav], { type: 'audio/wav' })
     const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `sample_${Date.now()}.wav`
-    link.click()
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'extracted_sample.wav'
+    a.click()
     URL.revokeObjectURL(url)
     setStatus('Sample extracted!')
   }
-
-  // Keyboard shortcuts
-  useKeyboardShortcuts({
-    ' ': () => player.isPlaying ? player.pause() : player.play(audioBuffer, player.getCurrentTime?.()),
-    'Delete': () => samples.length > 0 && handleRemoveSample(samples.length - 1),
-    'z': (e) => e.ctrlKey && undo(),
-    'y': (e) => e.ctrlKey && redo(),
-  })
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-6">
@@ -210,9 +256,13 @@ export default function App() {
                 bpm={bpm}
                 offset={offset}
                 subdivision={subdivision}
+                preLengthMs={preLengthMs}
+                postLengthMs={postLengthMs}
                 onBpmChange={setBpm}
                 onOffsetChange={setOffset}
                 onSubdivisionChange={setSubdivision}
+                onPreLengthChange={setPreLengthMs}
+                onPostLengthChange={setPostLengthMs}
               />
             )}
 
@@ -222,6 +272,8 @@ export default function App() {
                 audioBuffer={audioBuffer}
                 bpm={bpm}
                 offset={offset}
+                preLengthMs={preLengthMs}
+                postLengthMs={postLengthMs}
                 samples={samples}
                 onAddSample={handleAddSample}
                 onRemoveSample={handleRemoveSample}
@@ -290,15 +342,10 @@ export default function App() {
   )
 }
 
-function formatTime(sec) {
-  const mm = Math.floor(sec / 60)
-  const ss = Math.floor(sec % 60)
-  const ms = Math.floor((sec - Math.floor(sec)) * 1000)
-  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}.${String(ms).padStart(3, '0')}`
-}
-
+// WAV encoding utility
 function encodeWAV(float32Array, sampleRate) {
   const numChannels = 1
+  // 16-bit PCM data length in bytes
   const dataLength = float32Array.length * numChannels * 2
   const arrayBuffer = new ArrayBuffer(44 + dataLength)
   const view = new DataView(arrayBuffer)
@@ -310,16 +357,16 @@ function encodeWAV(float32Array, sampleRate) {
   }
 
   writeString(0, 'RIFF')
-  view.setUint32(4, 36 + dataLength, true)
+  view.setUint32(4, 36 + dataLength, true) // file size - 8
   writeString(8, 'WAVE')
   writeString(12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
+  view.setUint32(16, 16, true) // PCM chunk size
+  view.setUint16(20, 1, true) // audio format (1 = PCM)
   view.setUint16(22, numChannels, true)
   view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * numChannels * 2, true)
-  view.setUint16(32, numChannels * 2, true)
-  view.setUint16(34, 16, true)
+  view.setUint32(28, sampleRate * numChannels * 2, true) // byte rate
+  view.setUint16(32, numChannels * 2, true) // block align
+  view.setUint16(34, 16, true) // bits per sample
   writeString(36, 'data')
   view.setUint32(40, dataLength, true)
 
