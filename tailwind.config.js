@@ -5,31 +5,17 @@ export default {
   ],
   theme: {
     extend: {
-      colors: {
-        slate: {
-          950: '#0f172a',
-          900: '#0f1419',
-          850: '#1a202c',
-          800: '#1e293b',
-          700: '#334155',
-          600: '#475569',
-          500: '#64748b',
-          400: '#94a3b8',
-          300: '#cbd5e1',
-          200: '#e2e8f0',
-          100: '#f1f5f9',
-          50: '#f8fafc',
-        }
-      },
-      fontFamily: {
+      // Custom colors are defined in index.css now
+      /*fontFamily: {
         sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
         mono: ['Fira Code', 'monospace'],
       },
       spacing: {
         '18': '4.5rem',
         '22': '5.5rem',
-      }
+      }*/
     },
   },
   plugins: [],
 }
+
