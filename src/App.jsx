@@ -7,6 +7,14 @@ import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 import { useUndoRedo } from './hooks/useUndoRedo'
 
 export default function App() {
+  const [audioBuffer, setAudioBuffer] = useState(null)
+  const [bpm, setBpm] = useState(140)
+  const [offset, setOffset] = useState(0)
+  const [samples, setSamples] = useState([])
+  const [averagedSample, setAveragedSample] = useState(null)
+  const [status, setStatus] = useState('Load an audio file to begin')
+
+  // player & audio context
   const audioContextRef = useRef(null)
   const player = useAudioPlayer(audioContextRef)
   const { computeAverage } = useAudioProcessing()
@@ -32,15 +40,16 @@ export default function App() {
 
   // Recalculate averaged sample when samples change
   useEffect(() => {
-    if (audioBuffer && samples.length > 0) {
-      const averaged = computeAverage(audioBuffer, samples)
-      setAveragedSample(averaged)
-    } else {
-      setAveragedSample(null)
-    }
-  }, [samples, audioBuffer, computeAverage])
+    if (player) player.setVolume(playerVolume)
+  }, [player, playerVolume])
 
-  // Setup audio context metronome
+  // Keep isPlayingState in sync (not updated every frame)
+  useEffect(() => {
+    setIsPlayingState(player.isPlaying)
+  }, [player])
+
+
+  // Metronome: schedule a simple click using oscillator while player is playing
   useEffect(() => {
     let intervalId = null
     let timeoutId = null
@@ -129,14 +138,25 @@ export default function App() {
 
     const newSamples = [...samples, snappedTime].sort((a, b) => a - b)
     setSamples(newSamples)
-    setStatus(`Marked sample at ${formatTime(snappedTime)}`)
-  }, [audioBuffer, bpm, samples, snapToGrid, subdivision])
 
-  const handleRemoveSample = useCallback((index) => {
+    // Compute average
+    if (audioBuffer && newSamples.length > 0) {
+      const averaged = computeAverage(audioBuffer, newSamples)
+      setAveragedSample(averaged)
+    }
+  }
+
+  const handleRemoveSample = (index) => {
     const newSamples = samples.filter((_, i) => i !== index)
     setSamples(newSamples)
-    setStatus(`Removed sample at ${formatTime(samples[index])}`)
-  }, [samples])
+    
+    if (audioBuffer && newSamples.length > 0) {
+      const averaged = computeAverage(audioBuffer, newSamples)
+      setAveragedSample(averaged)
+    } else {
+      setAveragedSample(null)
+    }
+  }
 
   const handleClearSamples = () => {
     setSamples([])
@@ -169,59 +189,103 @@ export default function App() {
   })
 
   return (
-    <div className="flex h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 overflow-hidden">
-      <Sidebar
-        audioBuffer={audioBuffer}
-        onAudioLoaded={handleAudioLoaded}
-        samples={samples}
-        bpm={bpm}
-        onBpmChange={setBpm}
-        offset={offset}
-        onOffsetChange={setOffset}
-        subdivision={subdivision}
-        onSubdivisionChange={setSubdivision}
-        snapToGrid={snapToGrid}
-        onSnapToGridChange={setSnapToGrid}
-        metronomeEnabled={metronomeEnabled}
-        onMetronomeChange={setMetronomeEnabled}
-        metronomeVolume={metronomeVolume}
-        onMetronomeVolumeChange={setMetronomeVolume}
-        playerVolume={playerVolume}
-        onPlayerVolumeChange={setPlayerVolume}
-        zoom={zoom}
-        onZoomChange={setZoom}
-        status={status}
-        onRemoveSample={handleRemoveSample}
-        onClearSamples={handleClearSamples}
-        canUndo={canUndo}
-        canRedo={canRedo}
-        onUndo={undo}
-        onRedo={redo}
-        averagedSample={averagedSample}
-        onExtract={handleExtract}
-      />
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-6">
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
+        <div className="mb-8">
+          <h1 className="text-4xl font-bold text-slate-50 mb-2">Sample Extractor</h1>
+          <p className="text-slate-400">Mark occurrences, average, extract. Frame-perfect precision.</p>
+        </div>
 
-      <Editor
-        audioBuffer={audioBuffer}
-        bpm={bpm}
-        offset={offset}
-        samples={samples}
-        onAddSample={handleAddSample}
-        onRemoveSample={handleRemoveSample}
-        player={player}
-        audioContextRef={audioContextRef}
-        zoom={zoom}
-        averagedSample={averagedSample}
-        onPlayAveraged={() => {
-          if (averagedSample && audioContextRef.current) {
-            const buf = audioContextRef.current.createBuffer(1, averagedSample.length, audioContextRef.current.sampleRate)
-            buf.getChannelData(0).set(averagedSample)
-            player.play(buf, 0)
-          }
-        }}
-        snapToGrid={snapToGrid}
-        subdivision={subdivision}
-      />
+        {/* Main Grid */}
+        <div className="grid grid-cols-12 gap-6">
+          {/* Left Column */}
+          <div className="col-span-8 space-y-6">
+            {/* Audio Loader */}
+            <AudioLoader onAudioLoaded={handleAudioLoaded} setStatus={setStatus} />
+
+            {/* Timing Controls */}
+            {audioBuffer && (
+              <Controls
+                bpm={bpm}
+                offset={offset}
+                subdivision={subdivision}
+                onBpmChange={setBpm}
+                onOffsetChange={setOffset}
+                onSubdivisionChange={setSubdivision}
+              />
+            )}
+
+            {/* Waveform */}
+            {audioBuffer && (
+              <Waveform
+                audioBuffer={audioBuffer}
+                bpm={bpm}
+                offset={offset}
+                samples={samples}
+                onAddSample={handleAddSample}
+                onRemoveSample={handleRemoveSample}
+                onSeek={(t) => player.seek(t)}
+                onOffsetChange={setOffset}
+                player={player}
+                initialPixelsPerSecond={zoomPps}
+              />
+            )}
+
+            {/* Player (unified playback controls + metronome) */}
+            {audioBuffer && (
+              <Player
+                audioBuffer={audioBuffer}
+                player={player}
+                averagedSample={averagedSample}
+                audioContextRef={audioContextRef}
+                bpm={bpm}
+                offset={offset}
+                metronomeEnabled={metronomeEnabled}
+                setMetronomeEnabled={setMetronomeEnabled}
+                metronomeVolume={metronomeVolume}
+                setMetronomeVolume={setMetronomeVolume}
+              />
+            )}
+          </div>
+
+          {/* Right Column */}
+          <div className="col-span-4 space-y-6">
+            {/* Sample List */}
+            {audioBuffer && (
+              <SampleList
+                samples={samples}
+                onRemove={handleRemoveSample}
+              />
+            )}
+
+            {/* Preview */}
+            {audioBuffer && (
+              <PreviewWaveform
+                averagedSample={averagedSample}
+                sampleCount={samples.length}
+                onPlay={handlePlayAveraged}
+              />
+            )}
+
+            {/* Extract Button */}
+            {audioBuffer && (
+              <button
+                onClick={handleExtract}
+                disabled={!averagedSample}
+                className="w-full btn-primary disabled:opacity-50 disabled:cursor-not-allowed py-3 text-lg"
+              >
+                ⬇ Extract sample
+              </button>
+            )}
+
+            {/* Status */}
+            <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
+              <p className="text-sm text-slate-300">{status}</p>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
